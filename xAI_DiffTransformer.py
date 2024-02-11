@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from ViT_LRP import PatchEmbed, Attention, Mlp
 
 
 def modulate(x, shift, scale):
