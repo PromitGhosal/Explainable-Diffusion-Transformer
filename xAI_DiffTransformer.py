@@ -12,6 +12,18 @@ def modulate(x, shift, scale):
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
+def compute_rollout_attention(all_layer_matrices, start_layer=0):
+    # adding residual consideration
+    num_tokens = all_layer_matrices[0].shape[1]
+    batch_size = all_layer_matrices[0].shape[0]
+    eye = torch.eye(num_tokens).expand(batch_size, num_tokens, num_tokens).to(all_layer_matrices[0].device)
+    all_layer_matrices = [all_layer_matrices[i] + eye for i in range(len(all_layer_matrices))]
+    # all_layer_matrices = [all_layer_matrices[i] / all_layer_matrices[i].sum(dim=-1, keepdim=True)
+    #                       for i in range(len(all_layer_matrices))]
+    joint_attention = all_layer_matrices[start_layer]
+    for i in range(start_layer+1, len(all_layer_matrices)):
+        joint_attention = all_layer_matrices[i].bmm(joint_attention)
+    return joint_attention
 
 class TimestepEmbedder(nn.Module):
     """
@@ -52,6 +64,9 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+    def relprop(self, cam, **kwargs):
+        return self.timestep_embedding.relprop(cam, **kwargs)
+
 
 class LabelEmbedder(nn.Module):
     """
@@ -81,6 +96,9 @@ class LabelEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
         return embeddings
+
+    def relprop(self, cam, **kwargs):
+        return self.embedding_table.relprop(cam, **kwargs)
 
 
 #################################################################################
@@ -270,6 +288,73 @@ class DiT(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
+
+     def relprop(self, cam=None, method="grad", is_ablation=False, start_layer=0, **kwargs):
+        # print(kwargs)
+        # print("conservation 1", cam.sum())
+        cam = self.head.relprop(cam, **kwargs)
+        cam = cam.unsqueeze(1)
+        cam = self.pool.relprop(cam, **kwargs)
+        cam = self.norm.relprop(cam, **kwargs)
+        for blk in reversed(self.blocks):
+            cam = blk.relprop(cam, **kwargs)
+
+        # print("conservation 2", cam.sum())
+        # print("min", cam.min())
+
+        if method == "rollout":
+            # cam rollout
+            attn_cams = []
+            for blk in self.blocks:
+                attn_heads = blk.attn.get_attn_cam().clamp(min=0)
+                avg_heads = (attn_heads.sum(dim=1) / attn_heads.shape[1]).detach()
+                attn_cams.append(avg_heads)
+            cam = compute_rollout_attention(attn_cams, start_layer=start_layer)
+            cam = cam[:, 0, 1:]
+            return cam
+
+        elif method == "grad":
+            cams = []
+            for blk in self.blocks:
+                grad = blk.attn.get_attn_gradients()
+                cam = blk.attn.get_attn_cam()
+                cam = cam[0].reshape(-1, cam.shape[-1], cam.shape[-1])
+                grad = grad[0].reshape(-1, grad.shape[-1], grad.shape[-1])
+                cam = grad * cam
+                cam = cam.clamp(min=0).mean(dim=0)
+                cams.append(cam.unsqueeze(0))
+            rollout = compute_rollout_attention(cams, start_layer=start_layer)
+            cam = rollout[:, 0, 1:]
+            return cam
+
+        elif method == "last_layer":
+            cam = self.blocks[-1].attn.get_attn_cam()
+            cam = cam[0].reshape(-1, cam.shape[-1], cam.shape[-1])
+            if is_ablation:
+                grad = self.blocks[-1].attn.get_attn_gradients()
+                grad = grad[0].reshape(-1, grad.shape[-1], grad.shape[-1])
+                cam = grad * cam
+            cam = cam.clamp(min=0).mean(dim=0)
+            cam = cam[0, 1:]
+            return cam
+
+        elif method == "last_layer_attn":
+            cam = self.blocks[-1].attn.get_attn()
+            cam = cam[0].reshape(-1, cam.shape[-1], cam.shape[-1])
+            cam = cam.clamp(min=0).mean(dim=0)
+            cam = cam[0, 1:]
+            return cam
+
+        elif method == "second_layer":
+            cam = self.blocks[1].attn.get_attn_cam()
+            cam = cam[0].reshape(-1, cam.shape[-1], cam.shape[-1])
+            if is_ablation:
+                grad = self.blocks[1].attn.get_attn_gradients()
+                grad = grad[0].reshape(-1, grad.shape[-1], grad.shape[-1])
+                cam = grad * cam
+            cam = cam.clamp(min=0).mean(dim=0)
+            cam = cam[0, 1:]
+            return cam
 
 
 #################################################################################
